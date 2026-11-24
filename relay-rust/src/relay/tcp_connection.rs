@@ -201,6 +201,26 @@ fn connect_status(stream: &TcpStream) -> io::Result<bool> {
     }
 }
 
+/// Receive buffer of the socket to the server. Data the device cannot take yet waits in it, so
+/// beyond what keeps the relay fed, a larger buffer only adds delay. A server on the local network
+/// answers in well under a millisecond and needs little: with 1 MiB, bursts from a Virtual Desktop
+/// streamer on the host queued ~1.5 MB (~45 ms) inside the relay. Internet servers keep 1 MiB to
+/// cover their bandwidth-delay product.
+fn recv_buffer_size(destination: &std::net::SocketAddr) -> usize {
+    if is_local_network(destination.ip()) {
+        256 * 1024
+    } else {
+        1024 * 1024
+    }
+}
+
+fn is_local_network(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
 /// Build the SOCKS5 CONNECT request (RFC 1928 §4) for the given destination.
 ///
 /// The request layout is:
@@ -329,7 +349,7 @@ impl TcpConnection {
         stream.set_nodelay(true)?;
 
         let sock_ref = SockRef::from(&stream);
-        let _ = sock_ref.set_recv_buffer_size(1024 * 1024);
+        let _ = sock_ref.set_recv_buffer_size(recv_buffer_size(&dest));
         let _ = sock_ref.set_send_buffer_size(256 * 1024);
 
         let ka = TcpKeepalive::new().with_time(Duration::from_secs(60));
@@ -1149,7 +1169,7 @@ impl Connection for TcpConnection {
 mod tests {
     use super::build_socks5_connect_request;
     use super::{CLIENT_TO_NETWORK_CAPACITY, Tcb, TcpConnection, scaled_window, window_scale_for};
-    use super::{connect_nonblocking, connect_status};
+    use super::{connect_nonblocking, connect_status, recv_buffer_size};
     use crate::relay::ip_packet::IpPacket;
     use crate::relay::transport_header::TransportHeader;
     use socket2::{Domain, Socket, Type};
@@ -1168,6 +1188,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(true)
+    }
+
+    #[test]
+    fn small_receive_buffer_for_local_servers_only() {
+        let local = [
+            "127.0.0.1:1",
+            "192.168.1.101:38830",
+            "10.0.0.5:1",
+            "172.16.0.1:1",
+            "169.254.1.1:1",
+            "[::1]:1",
+            "[fd00::1]:1",
+            "[fe80::1]:1",
+        ];
+        for address in local {
+            assert_eq!(256 * 1024, recv_buffer_size(&address.parse().unwrap()), "{}", address);
+        }
+        for address in ["8.8.8.8:443", "57.144.245.141:443", "[2001:4860:4860::8888]:443"] {
+            assert_eq!(1024 * 1024, recv_buffer_size(&address.parse().unwrap()), "{}", address);
+        }
     }
 
     #[test]
