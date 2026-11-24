@@ -17,6 +17,7 @@
 use super::ip_header::IpHeaderData;
 use super::ipv4_header::Ipv4HeaderData;
 use byteorder::{BigEndian, ByteOrder};
+use std::cmp;
 use std::mem;
 
 pub struct TcpHeader<'a> {
@@ -437,6 +438,61 @@ impl<'a> TcpHeaderMut<'a> {
     }
 }
 
+const OPTION_END: u8 = 0;
+const OPTION_NOP: u8 = 1;
+const OPTION_WINDOW_SCALE: u8 = 3;
+const WINDOW_SCALE_OPTION_LENGTH: usize = 3;
+
+/// RFC 7323 §2.3: a shift count above 14 must be treated as 14.
+pub const MAX_WINDOW_SCALE: u8 = 14;
+
+/// Length of a TCP header whose only options are a NOP and a Window Scale option.
+pub const WINDOW_SCALE_HEADER_LENGTH: usize = 24;
+
+impl TcpHeader<'_> {
+    /// Shift count of the Window Scale option (RFC 7323 §2.2), if the header carries one.
+    pub fn window_scale(&self) -> Option<u8> {
+        let end = cmp::min(usize::from(self.data.header_length), self.raw.len());
+        parse_window_scale(self.raw.get(20..end)?)
+    }
+}
+
+fn parse_window_scale(options: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < options.len() {
+        match options[i] {
+            OPTION_END => return None,
+            OPTION_NOP => i += 1,
+            kind => {
+                let length = usize::from(*options.get(i + 1)?);
+                if length < 2 || i + length > options.len() {
+                    // malformed options
+                    return None;
+                }
+                if kind == OPTION_WINDOW_SCALE {
+                    if length != WINDOW_SCALE_OPTION_LENGTH {
+                        return None;
+                    }
+                    return Some(cmp::min(options[i + 2], MAX_WINDOW_SCALE));
+                }
+                i += length;
+            }
+        }
+    }
+    None
+}
+
+/// Build a TCP header whose fixed part is copied from `reference` and whose options are a NOP
+/// followed by a Window Scale option announcing `shift`.
+pub fn header_with_window_scale(reference: &[u8], shift: u8) -> [u8; WINDOW_SCALE_HEADER_LENGTH] {
+    let mut raw = [0u8; WINDOW_SCALE_HEADER_LENGTH];
+    raw[..20].copy_from_slice(&reference[..20]);
+    raw[20..].copy_from_slice(&[OPTION_NOP, OPTION_WINDOW_SCALE, WINDOW_SCALE_OPTION_LENGTH as u8, shift]);
+    // the data offset is the high nibble of byte 12, in 32-bit words
+    raw[12] = (((WINDOW_SCALE_HEADER_LENGTH / 4) as u8) << 4) | (raw[12] & 0x0F);
+    raw
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +500,60 @@ mod tests {
     use crate::relay::ipv4_packet::Ipv4Packet;
     use crate::relay::transport_header::TransportHeaderMut;
     use byteorder::{BigEndian, WriteBytesExt};
+
+    fn syn_header(options: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0u8; 20];
+        raw[12] = (((20 + options.len()) / 4) as u8) << 4;
+        raw[13] = FLAG_SYN as u8;
+        raw.extend_from_slice(options);
+        raw
+    }
+
+    fn window_scale_of(raw: &[u8]) -> Option<u8> {
+        let data = TcpHeaderData::parse(raw);
+        data.bind(raw).window_scale()
+    }
+
+    #[test]
+    fn parse_window_scale_from_linux_syn() {
+        // MSS, SACK permitted, timestamps, NOP, window scale 7 (the layout of a Linux SYN)
+        let options = [2, 4, 0x3f, 0xd8, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7];
+        assert_eq!(Some(7), window_scale_of(&syn_header(&options)));
+    }
+
+    #[test]
+    fn parse_window_scale_absent() {
+        assert_eq!(None, window_scale_of(&syn_header(&[])));
+        assert_eq!(None, window_scale_of(&syn_header(&[2, 4, 0x05, 0xb4])));
+    }
+
+    #[test]
+    fn parse_window_scale_clamped() {
+        assert_eq!(Some(14), window_scale_of(&syn_header(&[1, 3, 3, 15])));
+    }
+
+    #[test]
+    fn parse_window_scale_stops_at_end_of_options() {
+        assert_eq!(None, window_scale_of(&syn_header(&[0, 3, 3, 7])));
+    }
+
+    #[test]
+    fn parse_window_scale_rejects_malformed_options() {
+        // a zero length would loop forever if it were accepted
+        assert_eq!(None, window_scale_of(&syn_header(&[8, 0, 3, 3, 7, 0, 0, 0])));
+        // a length running past the end of the header
+        assert_eq!(None, window_scale_of(&syn_header(&[8, 10, 1, 3, 3, 7, 0, 0])));
+    }
+
+    #[test]
+    fn build_header_with_window_scale() {
+        let reference = syn_header(&[2, 4, 0x05, 0xb4]);
+        let raw = header_with_window_scale(&reference, 6);
+        let data = TcpHeaderData::parse(&raw);
+        assert_eq!(24, data.header_length());
+        assert!(data.is_syn());
+        assert_eq!(Some(6), data.bind(&raw).window_scale());
+    }
 
     fn create_packet() -> Vec<u8> {
         let mut raw = Vec::new();

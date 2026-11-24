@@ -21,7 +21,7 @@ use super::ip_packet::IpPacket;
 use super::ipv4_packet::MAX_PACKET_LENGTH;
 use super::packetizer::Packetizer;
 use super::stream_buffer::StreamBuffer;
-use super::tcp_header::{self, TcpHeader, TcpHeaderMut};
+use super::tcp_header::{self, TcpHeader, TcpHeaderData, TcpHeaderMut};
 use super::transport_header::{TransportHeader, TransportHeaderMut};
 use std::sync::OnceLock;
 
@@ -32,6 +32,10 @@ pub static SOCKS5_PROXY: OnceLock<std::net::SocketAddr> = OnceLock::new();
 
 const MTU: u16 = 1500;
 const MAX_PAYLOAD_LENGTH: u16 = MTU - 20 - 20_u16;
+
+/// Capacity of the buffer holding data from the device not yet written to the network. The
+/// window advertised to the device describes the free space in this buffer.
+const CLIENT_TO_NETWORK_CAPACITY: usize = 32 * MAX_PACKET_LENGTH;
 
 #[allow(dead_code)]
 pub static mut GLOBAL_BYTES_SENT: u64 = 0;
@@ -52,6 +56,10 @@ pub struct TcpConnection {
     /// Length of a packet that could not be written to the buffer yet
     /// (because the buffer was full). It is retried on each poll.
     packet_for_client_length: Option<u16>,
+    /// Packetizer for the SYN-ACK when the device asked for window scaling: the
+    /// SYN-ACK must carry a Window Scale option, which the main packetizer's
+    /// 20-byte header cannot hold. Dropped once the SYN-ACK is sent.
+    syn_ack_packetizer: Option<Packetizer>,
     closed: bool,
     tcb: Tcb,
     pub bytes_sent: u64,
@@ -66,7 +74,12 @@ struct Tcb {
     their_acknowledgement_number: u32,
     fin_sequence_number: Option<u32>,
     fin_received: bool,
-    client_window: u16,
+    /// Receive window of the device, in bytes (already scaled).
+    client_window: u32,
+    /// Shift applied to the window field of the device's segments (RFC 7323).
+    client_window_scale: u8,
+    /// Shift applied to the window field of the relay's segments (RFC 7323).
+    relay_window_scale: u8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -107,29 +120,41 @@ impl Tcb {
             fin_sequence_number: None,
             fin_received: false,
             client_window: 0,
+            client_window_scale: 0,
+            relay_window_scale: 0,
         }
     }
 
     #[inline]
-    fn remaining_client_window(&self) -> u16 {
+    fn remaining_client_window(&self) -> u32 {
         // If the client advertised a zero window, honor it immediately.
         if self.client_window == 0 {
             return 0;
         }
-    
-        let wrapped_remaining = Wrapping(self.their_acknowledgement_number) + Wrapping(u32::from(self.client_window))
-            - self.sequence_number;
+
+        let wrapped_remaining =
+            Wrapping(self.their_acknowledgement_number) + Wrapping(self.client_window) - self.sequence_number;
         let remaining = wrapped_remaining.0;
-        if remaining <= u32::from(self.client_window) {
-            remaining as u16
-        } else {
-            0
-        }
+        if remaining <= self.client_window { remaining } else { 0 }
     }
 
     fn numbers(&self) -> String {
         format!("(seq={}, ack={})", self.sequence_number, self.acknowledgement_number)
     }
+}
+
+/// Smallest RFC 7323 shift count that lets a 16-bit window field describe `capacity` bytes.
+fn window_scale_for(capacity: usize) -> u8 {
+    let mut shift = 0;
+    while shift < tcp_header::MAX_WINDOW_SCALE && (capacity >> shift) > usize::from(u16::MAX) {
+        shift += 1;
+    }
+    shift
+}
+
+/// Value of the 16-bit window field describing `bytes` of free space, for the given shift count.
+fn scaled_window(bytes: usize, shift: u8) -> u16 {
+    (bytes >> shift).min(usize::from(u16::MAX)) as u16
 }
 
 /// Build the SOCKS5 CONNECT request (RFC 1928 §4) for the given destination.
@@ -193,17 +218,42 @@ impl TcpConnection {
 
         let packetizer = Packetizer::new(&ip_header, &shrinked_transport_header);
 
+        // RFC 7323: window scaling is in effect only if both the SYN and the SYN-ACK carry the
+        // option. Without it, the device can never have more than 64 KiB unacknowledged, which caps
+        // each connection at 64 KiB per round trip.
+        let client_window_scale = if tcp_header.is_syn() {
+            tcp_header.window_scale()
+        } else {
+            None
+        };
+        let relay_window_scale = window_scale_for(CLIENT_TO_NETWORK_CAPACITY);
+        let syn_ack_packetizer =
+            client_window_scale.map(|_| Self::create_syn_ack_packetizer(&ip_header, &tcp_header, relay_window_scale));
+        let mut tcb = Tcb::new();
+        if let Some(scale) = client_window_scale {
+            cx_debug!(
+                target: TAG,
+                id,
+                "Window scaling: client shift={}, relay shift={}",
+                scale,
+                relay_window_scale
+            );
+            tcb.client_window_scale = scale;
+            tcb.relay_window_scale = relay_window_scale;
+        }
+
         let rc = Rc::new(RefCell::new(Self {
             self_weak: Weak::new(),
             id,
             client,
             buffer,
             stream,
-            client_to_network: StreamBuffer::new(32 * MAX_PACKET_LENGTH),
+            client_to_network: StreamBuffer::new(CLIENT_TO_NETWORK_CAPACITY),
             network_to_client: packetizer,
             packet_for_client_length: None,
+            syn_ack_packetizer,
             closed: false,
-            tcb: Tcb::new(),
+            tcb,
             bytes_sent: 0,
             bytes_received: 0,
         }));
@@ -213,6 +263,15 @@ impl TcpConnection {
             self_ref.self_weak = Rc::downgrade(&rc);
         }
         Ok(rc)
+    }
+
+    /// Packetizer for the SYN-ACK only: same headers as the main packetizer, plus a Window Scale
+    /// option announcing `relay_window_scale`.
+    fn create_syn_ack_packetizer(ip_header: &IpHeader, tcp_header: &TcpHeader, relay_window_scale: u8) -> Packetizer {
+        let raw = tcp_header::header_with_window_scale(tcp_header.raw(), relay_window_scale);
+        let data = TcpHeaderData::parse(&raw);
+        let transport_header: TransportHeader = data.bind(&raw).into();
+        Packetizer::new(ip_header, &transport_header)
     }
 
     fn create_stream(id: &ConnectionId) -> io::Result<TcpStream> {
@@ -523,7 +582,7 @@ impl TcpConnection {
                 break;
             }
             let remaining_client_window = self.tcb.remaining_client_window();
-            let max_payload_length = Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
+            let max_payload_length = Some(cmp::min(remaining_client_window, u32::from(MAX_PAYLOAD_LENGTH)) as usize);
             let advertised_window = self.advertised_window();
             Self::update_headers(
                 &mut self.network_to_client,
@@ -598,8 +657,24 @@ impl TcpConnection {
         debug_assert_eq!(self.tcb.state, TcpState::SynSent);
         self.tcb.state = TcpState::SynReceived;
         cx_debug!(target: TAG, self.id, "State = {:?}", self.tcb.state);
-        self.send_empty_packet_to_client(tcp_header::FLAG_SYN | tcp_header::FLAG_ACK);
+        self.send_syn_ack();
         self.tcb.sequence_number += Wrapping(1);
+    }
+
+    /// Send the SYN-ACK, with a Window Scale option if the device sent one in its SYN.
+    fn send_syn_ack(&mut self) {
+        let flags = tcp_header::FLAG_SYN | tcp_header::FLAG_ACK;
+        let Some(mut packetizer) = self.syn_ack_packetizer.take() else {
+            // no window scaling: relay_window_scale is 0, so the regular path is correct
+            self.send_empty_packet_to_client(flags);
+            return;
+        };
+        // RFC 7323 §2.2: the window field of a SYN segment is never scaled.
+        let window = scaled_window(self.client_to_network.remaining(), 0);
+        let ip_packet = Self::create_empty_response_packet(&self.id, &mut packetizer, &self.tcb, flags, window);
+        if Self::send_packet_to_buffer(&self.buffer, &ip_packet).is_err() {
+            cx_debug!(target: TAG, self.id, "Buffer unavailable, skipping SYN-ACK");
+        }
     }
 
     /// Send empty packet with the given flags to the client, writing directly
@@ -725,17 +800,18 @@ impl TcpConnection {
             return;
         }
 
-        if tcp_header.window() != self.tcb.client_window {
+        let client_window = u32::from(tcp_header.window()) << self.tcb.client_window_scale;
+        if client_window != self.tcb.client_window {
             cx_debug!(
                 target: TAG,
                 self.id,
                 "Client window: {} -> {}",
                 self.tcb.client_window,
-                tcp_header.window()
+                client_window
             );
         }
 
-        self.tcb.client_window = tcp_header.window();
+        self.tcb.client_window = client_window;
         self.tcb.their_acknowledgement_number = tcp_header.acknowledgement_number();
 
         cx_debug!(
@@ -790,7 +866,8 @@ impl TcpConnection {
                 self.tcb.sequence_number,
                 self.tcb.acknowledgement_number
             );
-            self.tcb.client_window = tcp_header.window();
+            // RFC 7323 §2.2: the window field of a SYN segment is never scaled.
+            self.tcb.client_window = u32::from(tcp_header.window());
             self.tcb.state = TcpState::SynSent;
             cx_debug!(target: TAG, self.id, "State = {:?}", self.tcb.state);
         } else {
@@ -989,7 +1066,7 @@ impl TcpConnection {
     /// sending, avoiding the "Not enough space, dropping packet" → retransmit
     /// → "Ignoring packet" loop that burns CPU.
     fn advertised_window(&self) -> u16 {
-        self.client_to_network.remaining().min(u16::MAX as usize) as u16
+        scaled_window(self.client_to_network.remaining(), self.tcb.relay_window_scale)
     }
 
     fn may_write(&self) -> bool {
@@ -1027,6 +1104,120 @@ impl Connection for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::build_socks5_connect_request;
+    use super::{CLIENT_TO_NETWORK_CAPACITY, Tcb, TcpConnection, scaled_window, window_scale_for};
+    use crate::relay::ip_packet::IpPacket;
+    use crate::relay::transport_header::TransportHeader;
+    use std::num::Wrapping;
+
+    /// TCP header of a Linux SYN: MSS, SACK permitted, timestamps, NOP, window scale 7.
+    fn linux_syn_tcp_header() -> Vec<u8> {
+        let mut tcp = vec![
+            0x9a, 0x48, 0x97, 0xae, // source port 39496, destination port 38830
+            0x12, 0x34, 0x56, 0x78, // sequence number
+            0, 0, 0, 0, // acknowledgement number
+            0xa0, 0x02, // data offset 10 words (40 bytes), flags SYN
+            0xff, 0xff, // window
+            0, 0, 0, 0, // checksum, urgent pointer
+        ];
+        tcp.extend_from_slice(&[2, 4, 0x3f, 0xd8, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7]);
+        tcp
+    }
+
+    fn ipv4_syn() -> Vec<u8> {
+        let tcp = linux_syn_tcp_header();
+        let mut raw = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 2, 192, 168, 1, 101];
+        let total_length = (raw.len() + tcp.len()) as u16;
+        raw[2..4].copy_from_slice(&total_length.to_be_bytes());
+        raw.extend_from_slice(&tcp);
+        raw
+    }
+
+    fn ipv6_syn() -> Vec<u8> {
+        let tcp = linux_syn_tcp_header();
+        let mut raw = vec![0x60, 0, 0, 0];
+        raw.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&[6, 64]); // next header TCP, hop limit
+        raw.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]); // source
+        raw.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // destination
+        raw.extend_from_slice(&tcp);
+        raw
+    }
+
+    /// One's complement sum (RFC 1071), continuing from `sum`.
+    fn checksum(data: &[u8], mut sum: u32) -> u32 {
+        for chunk in data.chunks(2) {
+            sum += (u32::from(chunk[0]) << 8) | u32::from(*chunk.get(1).unwrap_or(&0));
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        sum
+    }
+
+    fn syn_ack_for(syn: &mut [u8], relay_window_scale: u8) -> Vec<u8> {
+        let packet = IpPacket::parse(syn).unwrap();
+        let (ip_header, transport_header) = packet.headers();
+        let Some(TransportHeader::Tcp(tcp_header)) = transport_header else {
+            panic!("Not a TCP packet");
+        };
+        assert_eq!(Some(7), tcp_header.window_scale());
+        let mut packetizer = TcpConnection::create_syn_ack_packetizer(&ip_header, &tcp_header, relay_window_scale);
+        packetizer.packetize_empty_payload().raw().to_vec()
+    }
+
+    #[test]
+    fn syn_ack_carries_window_scale_ipv4() {
+        let raw = syn_ack_for(&mut ipv4_syn(), 6);
+        assert_eq!(44, raw.len());
+        assert_eq!(44, u16::from_be_bytes([raw[2], raw[3]]));
+        assert_eq!(0xFFFF, checksum(&raw[..20], 0), "IPv4 header checksum");
+        let tcp = &raw[20..];
+        assert_eq!(&tcp[..4], &[0x97, 0xae, 0x9a, 0x48], "ports must be swapped");
+        assert_eq!(6, tcp[12] >> 4, "data offset");
+        assert_eq!(&tcp[20..24], &[1, 3, 3, 6]);
+        let mut pseudo = raw[12..20].to_vec();
+        pseudo.extend_from_slice(&[0, 6, 0, tcp.len() as u8]);
+        assert_eq!(0xFFFF, checksum(tcp, checksum(&pseudo, 0)), "TCP checksum");
+    }
+
+    #[test]
+    fn syn_ack_carries_window_scale_ipv6() {
+        let raw = syn_ack_for(&mut ipv6_syn(), 6);
+        assert_eq!(64, raw.len());
+        assert_eq!(24, u16::from_be_bytes([raw[4], raw[5]]), "payload length");
+        let tcp = &raw[40..];
+        assert_eq!(6, tcp[12] >> 4, "data offset");
+        assert_eq!(&tcp[20..24], &[1, 3, 3, 6]);
+        let mut pseudo = raw[8..40].to_vec();
+        pseudo.extend_from_slice(&[0, 0, 0, tcp.len() as u8, 0, 0, 0, 6]);
+        assert_eq!(0xFFFF, checksum(tcp, checksum(&pseudo, 0)), "TCP checksum");
+    }
+
+    #[test]
+    fn window_scale_covers_buffer_capacity() {
+        assert_eq!(0, window_scale_for(65535));
+        assert_eq!(1, window_scale_for(65536));
+        assert_eq!(6, window_scale_for(CLIENT_TO_NETWORK_CAPACITY));
+        assert_eq!(14, window_scale_for(usize::MAX));
+    }
+
+    #[test]
+    fn scaled_window_never_overstates_free_space() {
+        assert_eq!(65535, scaled_window(CLIENT_TO_NETWORK_CAPACITY, 0));
+        assert_eq!(32768, scaled_window(CLIENT_TO_NETWORK_CAPACITY, 6));
+        assert_eq!(0, scaled_window(63, 6));
+        assert_eq!(1, scaled_window(127, 6));
+    }
+
+    #[test]
+    fn remaining_client_window_beyond_64k() {
+        let mut tcb = Tcb::new();
+        tcb.their_acknowledgement_number = 1000;
+        tcb.sequence_number = Wrapping(1000 + 4096);
+        // window field 32767 with a client shift of 7: about 4 MiB
+        tcb.client_window = 0x7fff << 7;
+        assert_eq!((0x7fff << 7) - 4096, tcb.remaining_client_window());
+    }
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
