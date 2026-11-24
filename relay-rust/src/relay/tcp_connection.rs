@@ -4,10 +4,10 @@
 
 use log::*;
 use rand::random;
-use socket2::{SockRef, TcpKeepalive};
+use socket2::{Domain, SockRef, Socket, TcpKeepalive, Type};
 use std::cell::RefCell;
 use std::cmp;
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::num::Wrapping;
 use std::rc::{Rc, Weak};
@@ -157,6 +157,50 @@ fn scaled_window(bytes: usize, shift: u8) -> u16 {
     (bytes >> shift).min(usize::from(u16::MAX)) as u16
 }
 
+/// Start connecting to `destination` without waiting for the handshake.
+///
+/// Every connection of a client is polled from one thread, so a blocking connect would stall all
+/// of them (including established streams) until the server answers, or until the OS connect
+/// timeout when it never does. `connect_status()` reports when the connection completes.
+fn connect_nonblocking(destination: &std::net::SocketAddr) -> io::Result<TcpStream> {
+    let socket = Socket::new(
+        Domain::for_address(*destination),
+        Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&(*destination).into()) {
+        Ok(()) => {}
+        Err(ref err) if is_connect_in_progress(err) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(socket.into())
+}
+
+fn is_connect_in_progress(err: &io::Error) -> bool {
+    // Unix reports EINPROGRESS. Windows reports WSAEWOULDBLOCK, which maps to WouldBlock.
+    #[cfg(unix)]
+    {
+        if err.raw_os_error() == Some(libc::EINPROGRESS) {
+            return true;
+        }
+    }
+    err.kind() == io::ErrorKind::WouldBlock
+}
+
+/// State of a non-blocking connect: `Ok(true)` once established, `Ok(false)` while the handshake
+/// is in progress, `Err` if it failed.
+fn connect_status(stream: &TcpStream) -> io::Result<bool> {
+    if let Some(err) = stream.take_error()? {
+        return Err(err);
+    }
+    match stream.peer_addr() {
+        Ok(_) => Ok(true),
+        Err(ref err) if err.kind() == io::ErrorKind::NotConnected => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Build the SOCKS5 CONNECT request (RFC 1928 §4) for the given destination.
 ///
 /// The request layout is:
@@ -279,7 +323,7 @@ impl TcpConnection {
         let stream = if let Some(proxy) = SOCKS5_PROXY.get() {
             Self::connect_via_socks5(proxy, &dest)?
         } else {
-            TcpStream::connect(dest)?
+            connect_nonblocking(&dest)?
         };
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
@@ -489,12 +533,12 @@ impl TcpConnection {
         }
 
         if self.tcb.state == TcpState::SynSent {
-            match self.stream.write(b"") {
-                Ok(_) => {
+            match connect_status(&self.stream) {
+                Ok(true) => {
                     self.process_connect();
                     made_progress = true;
                 }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(false) => {}
                 Err(err) => {
                     cx_error!(
                         target: TAG,
@@ -1105,9 +1149,57 @@ impl Connection for TcpConnection {
 mod tests {
     use super::build_socks5_connect_request;
     use super::{CLIENT_TO_NETWORK_CAPACITY, Tcb, TcpConnection, scaled_window, window_scale_for};
+    use super::{connect_nonblocking, connect_status};
     use crate::relay::ip_packet::IpPacket;
     use crate::relay::transport_header::TransportHeader;
+    use socket2::{Domain, Socket, Type};
+    use std::io;
+    use std::net::{TcpListener, TcpStream};
     use std::num::Wrapping;
+    use std::time::{Duration, Instant};
+
+    /// Poll `connect_status()` until the connect completes, fails, or 5 seconds pass.
+    fn wait_for_connect(stream: &TcpStream) -> io::Result<bool> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connect_status(stream)? {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(true)
+    }
+
+    #[test]
+    fn nonblocking_connect_completes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = connect_nonblocking(&listener.local_addr().unwrap()).unwrap();
+        assert!(wait_for_connect(&stream).unwrap());
+    }
+
+    #[test]
+    fn nonblocking_connect_reports_refusal() {
+        let address = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        // the listener is dropped: nothing accepts on this port any more
+        let result = connect_nonblocking(&address).and_then(|stream| wait_for_connect(&stream));
+        assert!(result.is_err(), "expected a refused connection, got {:?}", result);
+    }
+
+    #[test]
+    fn nonblocking_connect_does_not_wait_for_the_server() {
+        // A socket bound without listening: macOS drops SYNs to it without a reset, so a blocking
+        // connect would wait for the OS connect timeout (Linux refuses the connection instead).
+        let silent = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        silent.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        let address = silent.local_addr().unwrap().as_socket().unwrap();
+        let start = Instant::now();
+        let _ = connect_nonblocking(&address);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "connect blocked for {:?}",
+            start.elapsed()
+        );
+    }
 
     /// TCP header of a Linux SYN: MSS, SACK permitted, timestamps, NOP, window scale 7.
     fn linux_syn_tcp_header() -> Vec<u8> {
