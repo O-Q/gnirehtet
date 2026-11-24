@@ -124,7 +124,6 @@ impl UdpConnection {
             return Ok(());
         }
 
-        self.touch();
         let mut made_progress = false;
 
         // Try to send data to the network
@@ -172,6 +171,9 @@ impl UdpConnection {
         }
 
         if made_progress {
+            // Only real traffic counts as activity: the relay loop polls every connection
+            // continuously, so touching on every poll would keep idle sockets open forever.
+            self.touch();
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "Connection would block"))
@@ -278,5 +280,75 @@ impl Connection for UdpConnection {
 
     fn poll(&mut self) -> io::Result<()> {
         self.poll_self()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IDLE_TIMEOUT_SECONDS, UdpConnection};
+    use crate::relay::client::{ClientChannel, SharedBuffer};
+    use crate::relay::connection::{Connection, ConnectionId};
+    use crate::relay::ip_packet::IpPacket;
+    use crate::relay::ipv4_packet::MAX_PACKET_LENGTH;
+    use crate::relay::stream_buffer::StreamBuffer;
+    use std::cell::RefCell;
+    use std::net::UdpSocket;
+    use std::rc::{Rc, Weak};
+    use std::time::{Duration, Instant};
+
+    /// IPv4/UDP datagram from 10.0.0.2:40000 to 127.0.0.1:`port` with a 4-byte payload.
+    fn udp_packet(port: u16) -> Vec<u8> {
+        let mut raw = vec![
+            0x45, 0x00, 0x00, 0x20, // version, IHL, ToS, total length 32
+            0x00, 0x00, 0x00, 0x00, // id, flags, fragment offset
+            0x40, 0x11, 0x00, 0x00, // TTL 64, protocol UDP, checksum
+            10, 0, 0, 2, // source address
+            127, 0, 0, 1, // destination address
+            0x9c, 0x40, 0x00, 0x00, // source port 40000, destination port (set below)
+            0x00, 0x0c, 0x00, 0x00, // UDP length 12, checksum
+            0x11, 0x22, 0x33, 0x44, // payload
+        ];
+        raw[22..24].copy_from_slice(&port.to_be_bytes());
+        raw
+    }
+
+    fn create(raw: &mut [u8], buffer: &SharedBuffer) -> Rc<RefCell<UdpConnection>> {
+        let packet = IpPacket::parse(raw).unwrap();
+        let (ip_header_data, transport_header_data) = packet.headers_data();
+        let id = ConnectionId::from_headers(&ip_header_data, transport_header_data.unwrap(), Rc::from(""));
+        let (ip_header, transport_header) = packet.headers();
+        UdpConnection::create(id, Weak::new(), buffer.clone(), ip_header, transport_header.unwrap()).unwrap()
+    }
+
+    /// Pretend the connection has been idle for longer than the timeout.
+    fn backdate(connection: &RefCell<UdpConnection>) {
+        connection.borrow_mut().idle_since = Instant::now() - Duration::from_secs(IDLE_TIMEOUT_SECONDS + 1);
+    }
+
+    #[test]
+    fn polling_without_traffic_lets_the_connection_expire() {
+        // the relay loop polls every connection continuously, so polling alone must not count as activity
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let buffer: SharedBuffer = Rc::new(RefCell::new(StreamBuffer::new(4 * MAX_PACKET_LENGTH)));
+        let mut raw = udp_packet(server.local_addr().unwrap().port());
+        let connection = create(&mut raw, &buffer);
+        backdate(&connection);
+        for _ in 0..10 {
+            let _ = connection.borrow_mut().poll();
+        }
+        assert!(connection.borrow().is_expired());
+    }
+
+    #[test]
+    fn traffic_keeps_the_connection_alive() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let buffer: SharedBuffer = Rc::new(RefCell::new(StreamBuffer::new(4 * MAX_PACKET_LENGTH)));
+        let mut raw = udp_packet(server.local_addr().unwrap().port());
+        let connection = create(&mut raw, &buffer);
+        backdate(&connection);
+        let packet = IpPacket::parse(&mut raw).unwrap();
+        connection.borrow_mut().send_to_network(&mut ClientChannel::new(buffer.clone()), &packet);
+        connection.borrow_mut().poll().unwrap();
+        assert!(!connection.borrow().is_expired());
     }
 }

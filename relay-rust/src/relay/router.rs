@@ -162,7 +162,20 @@ impl Router {
                             entry.insert(connection);
                         }
                         Err(err) => {
-                            error!(target: TAG, "Cannot create route, dropping packet: {}", err);
+                            // Answer a SYN with a RST: dropped silently, it leaves the device
+                            // waiting for retransmission timeouts before it tries another address
+                            // (e.g. IPv4 when the host has no IPv6 route).
+                            let reset = match id.protocol() {
+                                Protocol::Tcp => TcpConnection::reset_for_syn(ip_packet),
+                                _ => None,
+                            };
+                            match reset {
+                                Some(reset) => {
+                                    error!(target: TAG, "Cannot create route, resetting {}: {}", id, err);
+                                    let _ = client_channel.send_raw_to_client(&reset);
+                                }
+                                None => error!(target: TAG, "Cannot create route, dropping packet: {}", err),
+                            }
                         }
                     }
                 }

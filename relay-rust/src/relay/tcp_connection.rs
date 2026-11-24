@@ -267,20 +267,7 @@ impl TcpConnection {
         let stream = Self::create_stream(&id)?;
 
         let tcp_header = Self::tcp_header_of_transport(transport_header);
-
-        // shrink the TCP options to pass a minimal reference header to the packetizer
-        let mut shrinked_tcp_header_raw = [0u8; 20];
-        shrinked_tcp_header_raw.copy_from_slice(&tcp_header.raw()[..20]);
-        let mut shrinked_tcp_header_data = tcp_header.data().clone();
-        {
-            let mut shrinked_tcp_header = shrinked_tcp_header_data.bind_mut(&mut shrinked_tcp_header_raw);
-            shrinked_tcp_header.shrink_options();
-            debug_assert_eq!(20, shrinked_tcp_header.header_length());
-        }
-
-        let shrinked_transport_header = shrinked_tcp_header_data.bind(&shrinked_tcp_header_raw).into();
-
-        let packetizer = Packetizer::new(&ip_header, &shrinked_transport_header);
+        let packetizer = Self::create_packetizer(&ip_header, &tcp_header);
 
         // RFC 7323: window scaling is in effect only if both the SYN and the SYN-ACK carry the
         // option. Without it, the device can never have more than 64 KiB unacknowledged, which caps
@@ -327,6 +314,42 @@ impl TcpConnection {
             self_ref.self_weak = Rc::downgrade(&rc);
         }
         Ok(rc)
+    }
+
+    /// Packetizer for packets to the device: the headers of `tcp_header` with source and
+    /// destination swapped and no TCP options.
+    fn create_packetizer(ip_header: &IpHeader, tcp_header: &TcpHeader) -> Packetizer {
+        // shrink the TCP options to pass a minimal reference header to the packetizer
+        let mut shrinked_tcp_header_raw = [0u8; 20];
+        shrinked_tcp_header_raw.copy_from_slice(&tcp_header.raw()[..20]);
+        let mut shrinked_tcp_header_data = tcp_header.data().clone();
+        {
+            let mut shrinked_tcp_header = shrinked_tcp_header_data.bind_mut(&mut shrinked_tcp_header_raw);
+            shrinked_tcp_header.shrink_options();
+            debug_assert_eq!(20, shrinked_tcp_header.header_length());
+        }
+
+        let shrinked_transport_header = shrinked_tcp_header_data.bind(&shrinked_tcp_header_raw).into();
+        Packetizer::new(ip_header, &shrinked_transport_header)
+    }
+
+    /// RST answering a SYN the relay cannot connect, so the device fails the connect at once
+    /// (and tries its next address, e.g. IPv4 after IPv6) instead of waiting for its SYN
+    /// retransmissions to time out. `None` if the packet is not a SYN.
+    pub fn reset_for_syn(ip_packet: &IpPacket) -> Option<Vec<u8>> {
+        let (ip_header, Some(TransportHeader::Tcp(tcp_header))) = ip_packet.headers() else {
+            return None;
+        };
+        if !tcp_header.is_syn() || tcp_header.is_ack() {
+            return None;
+        }
+        let mut packetizer = Self::create_packetizer(&ip_header, &tcp_header);
+        // RFC 9293 §3.10.7.1: the SYN carries no ACK, so the RST has sequence number 0 and must
+        // acknowledge the SYN, or the device ignores it.
+        let mut tcb = Tcb::new();
+        tcb.acknowledgement_number = Wrapping(tcp_header.sequence_number()) + Wrapping(1);
+        Self::update_headers(&mut packetizer, &tcb, tcp_header::FLAG_RST | tcp_header::FLAG_ACK, 0);
+        Some(packetizer.packetize_empty_payload().raw().to_vec())
     }
 
     /// Packetizer for the SYN-ACK only: same headers as the main packetizer, plus a Window Scale
@@ -1323,6 +1346,33 @@ mod tests {
         let mut pseudo = raw[8..40].to_vec();
         pseudo.extend_from_slice(&[0, 0, 0, tcp.len() as u8, 0, 0, 0, 6]);
         assert_eq!(0xFFFF, checksum(tcp, checksum(&pseudo, 0)), "TCP checksum");
+    }
+
+    #[test]
+    fn reset_for_syn_acknowledges_the_syn() {
+        let syn = ipv6_syn();
+        let mut packet_raw = syn.clone();
+        let raw = TcpConnection::reset_for_syn(&IpPacket::parse(&mut packet_raw).unwrap()).unwrap();
+        assert_eq!(60, raw.len());
+        assert_eq!(20, u16::from_be_bytes([raw[4], raw[5]]), "payload length");
+        assert_eq!(&raw[8..24], &syn[24..40], "source must be the original destination");
+        assert_eq!(&raw[24..40], &syn[8..24], "destination must be the original source");
+        let tcp = &raw[40..];
+        assert_eq!(&tcp[..4], &[0x97, 0xae, 0x9a, 0x48], "ports must be swapped");
+        assert_eq!(&tcp[4..8], &[0, 0, 0, 0], "sequence number");
+        assert_eq!(&tcp[8..12], &[0x12, 0x34, 0x56, 0x79], "must acknowledge the SYN");
+        assert_eq!(5, tcp[12] >> 4, "data offset");
+        assert_eq!(0x14, tcp[13], "flags RST|ACK");
+        let mut pseudo = raw[8..40].to_vec();
+        pseudo.extend_from_slice(&[0, 0, 0, tcp.len() as u8, 0, 0, 0, 6]);
+        assert_eq!(0xFFFF, checksum(tcp, checksum(&pseudo, 0)), "TCP checksum");
+    }
+
+    #[test]
+    fn reset_for_syn_ignores_other_packets() {
+        let mut ack = ipv4_syn();
+        ack[33] = 0x10; // flags ACK
+        assert!(TcpConnection::reset_for_syn(&IpPacket::parse(&mut ack).unwrap()).is_none());
     }
 
     #[test]
