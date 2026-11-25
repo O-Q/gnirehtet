@@ -17,6 +17,7 @@
 package com.genymobile.gnirehtet;
 
 import android.net.VpnService;
+import android.os.Process;
 import android.util.Log;
 
 import java.io.FileDescriptor;
@@ -38,6 +39,15 @@ public class Forwarder {
     private static final String TAG = Forwarder.class.getSimpleName();
 
     private static final int BUFSIZE = 0x10000;
+
+    /**
+     * Priority of the two forwarding threads: nice -16, the priority Virtual Desktop gives its
+     * decoder threads. At the default (nice 0) they lose the CPU to every app thread above nice 0,
+     * including the ones waiting for the data they carry: on a Quest 3 during 300-500 Mbps bursts,
+     * the tunnel-to-device thread spent 32-43% of its time waiting to run and the device-to-tunnel
+     * thread (which carries the TCP ACKs) 50-58%.
+     */
+    private static final int FORWARDING_THREAD_PRIORITY = Process.THREAD_PRIORITY_AUDIO;
 
     private static final byte[] DUMMY_ADDRESS = {42, 42, 42, 42};
     private static final int DUMMY_PORT = 4242;
@@ -90,6 +100,7 @@ public class Forwarder {
     @SuppressWarnings("checkstyle:MagicNumber")
     private void forwardDeviceToTunnel(Tunnel tunnel) throws IOException {
         Log.d(TAG, "Device to tunnel forwarding started");
+        raiseThreadPriority();
         FileInputStream vpnInput = new FileInputStream(vpnFileDescriptor);
         byte[] buffer = new byte[BUFSIZE];
         while (true) {
@@ -116,6 +127,7 @@ public class Forwarder {
 
     private void forwardTunnelToDevice(Tunnel tunnel) throws IOException {
         Log.d(TAG, "Tunnel to device forwarding started");
+        raiseThreadPriority();
         FileOutputStream vpnOutput = new FileOutputStream(vpnFileDescriptor);
         IPPacketOutputStream packetOutputStream = new IPPacketOutputStream(vpnOutput);
 
@@ -135,6 +147,14 @@ public class Forwarder {
             }
         }
         Log.d(TAG, "Tunnel to device forwarding stopped");
+    }
+
+    private static void raiseThreadPriority() {
+        try {
+            Process.setThreadPriority(FORWARDING_THREAD_PRIORITY);
+        } catch (IllegalArgumentException | SecurityException e) {
+            Log.w(TAG, "Cannot raise forwarding thread priority", e);
+        }
     }
 
     /**
