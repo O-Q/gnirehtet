@@ -30,8 +30,14 @@ const TAG: &str = "TcpConnection";
 /// Global SOCKS5 proxy address, set at startup by the CLI `--socks5` flag.
 pub static SOCKS5_PROXY: OnceLock<std::net::SocketAddr> = OnceLock::new();
 
-const MTU: u16 = 1500;
-const MAX_PAYLOAD_LENGTH: u16 = MTU - 20 - 20_u16;
+/// Largest payload sent to the device when its SYN announces no MSS: what a 1500-byte MTU allows.
+const DEFAULT_MAX_PAYLOAD_LENGTH: u16 = 1500 - 20 - 20;
+
+/// Largest payload that keeps a packet's length within 16 bits with any IP header.
+const MAX_PAYLOAD_LENGTH: u16 = u16::MAX - 40 - 20;
+
+/// Bytes read from the server per poll, at most (plus one segment).
+const MAX_BYTES_PER_POLL: usize = 32 * DEFAULT_MAX_PAYLOAD_LENGTH as usize;
 
 /// Capacity of the buffer holding data from the device not yet written to the network. The
 /// window advertised to the device describes the free space in this buffer.
@@ -62,6 +68,8 @@ pub struct TcpConnection {
     syn_ack_packetizer: Option<Packetizer>,
     closed: bool,
     tcb: Tcb,
+    /// Largest payload of a segment to the device: the MSS of its SYN.
+    max_payload_length: u16,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -140,6 +148,18 @@ impl Tcb {
 
     fn numbers(&self) -> String {
         format!("(seq={}, ack={})", self.sequence_number, self.acknowledgement_number)
+    }
+}
+
+/// Largest payload of a segment to the device, given the MSS option of its SYN.
+///
+/// The device announces the MSS its VPN interface allows (16344 bytes for the client's 16384-byte
+/// MTU). Every segment costs the client a write to that interface, so sending 1460-byte segments
+/// to such a device multiplies its work per byte by 11.
+fn max_payload_length_for(mss: Option<u16>) -> u16 {
+    match mss {
+        Some(mss) if mss > 0 => mss.min(MAX_PAYLOAD_LENGTH),
+        _ => DEFAULT_MAX_PAYLOAD_LENGTH,
     }
 }
 
@@ -278,6 +298,7 @@ impl TcpConnection {
             None
         };
         let relay_window_scale = window_scale_for(CLIENT_TO_NETWORK_CAPACITY);
+        let max_payload_length = max_payload_length_for(if tcp_header.is_syn() { tcp_header.mss() } else { None });
         let syn_ack_packetizer =
             client_window_scale.map(|_| Self::create_syn_ack_packetizer(&ip_header, &tcp_header, relay_window_scale));
         let mut tcb = Tcb::new();
@@ -305,6 +326,7 @@ impl TcpConnection {
             syn_ack_packetizer,
             closed: false,
             tcb,
+            max_payload_length,
             bytes_sent: 0,
             bytes_received: 0,
         }));
@@ -655,11 +677,12 @@ impl TcpConnection {
         // Read as many packets as possible per poll. Reading only one packet
         // per call caps throughput at one packet per client-loop iteration,
         // which forces the remote server's send window closed and starves
-        // bulk transfers (speed tests, large downloads).
-        const MAX_PACKETS_PER_POLL: usize = 32;
+        // bulk transfers (speed tests, large downloads). The budget is in
+        // bytes so that larger segments do not fill the client buffer faster.
         let mut made_progress = false;
+        let mut bytes_read = 0;
 
-        for _ in 0..MAX_PACKETS_PER_POLL {
+        while bytes_read < MAX_BYTES_PER_POLL {
             // If a previous packet could not be flushed to the client buffer,
             // stop reading: we don't want to accumulate more pending data.
             if self.packet_for_client_length.is_some() {
@@ -669,7 +692,8 @@ impl TcpConnection {
                 break;
             }
             let remaining_client_window = self.tcb.remaining_client_window();
-            let max_payload_length = Some(cmp::min(remaining_client_window, u32::from(MAX_PAYLOAD_LENGTH)) as usize);
+            let max_payload_length =
+                Some(cmp::min(remaining_client_window, u32::from(self.max_payload_length)) as usize);
             let advertised_window = self.advertised_window();
             Self::update_headers(
                 &mut self.network_to_client,
@@ -694,6 +718,7 @@ impl TcpConnection {
                                 self.tcb.numbers()
                             );
                             self.tcb.sequence_number += Wrapping(len as u32);
+                            bytes_read += len;
                             made_progress = true;
                         }
                         Err(_) => {
@@ -1192,6 +1217,7 @@ impl Connection for TcpConnection {
 mod tests {
     use super::build_socks5_connect_request;
     use super::{CLIENT_TO_NETWORK_CAPACITY, Tcb, TcpConnection, scaled_window, window_scale_for};
+    use super::{DEFAULT_MAX_PAYLOAD_LENGTH, max_payload_length_for};
     use super::{connect_nonblocking, connect_status, recv_buffer_size};
     use crate::relay::ip_packet::IpPacket;
     use crate::relay::transport_header::TransportHeader;
@@ -1373,6 +1399,25 @@ mod tests {
         let mut ack = ipv4_syn();
         ack[33] = 0x10; // flags ACK
         assert!(TcpConnection::reset_for_syn(&IpPacket::parse(&mut ack).unwrap()).is_none());
+    }
+
+    #[test]
+    fn segments_follow_the_device_mss() {
+        assert_eq!(16344, max_payload_length_for(Some(16344)));
+        assert_eq!(1220, max_payload_length_for(Some(1220)));
+    }
+
+    #[test]
+    fn segments_without_mss_keep_the_default() {
+        assert_eq!(DEFAULT_MAX_PAYLOAD_LENGTH, max_payload_length_for(None));
+        assert_eq!(DEFAULT_MAX_PAYLOAD_LENGTH, max_payload_length_for(Some(0)));
+    }
+
+    #[test]
+    fn segments_fit_a_16_bit_packet_length() {
+        let payload = max_payload_length_for(Some(u16::MAX));
+        // largest headers: IPv6 (40 bytes) and TCP without options (20 bytes)
+        assert!(u32::from(payload) + 60 <= u32::from(u16::MAX));
     }
 
     #[test]

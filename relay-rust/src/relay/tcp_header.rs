@@ -440,6 +440,8 @@ impl<'a> TcpHeaderMut<'a> {
 
 const OPTION_END: u8 = 0;
 const OPTION_NOP: u8 = 1;
+const OPTION_MSS: u8 = 2;
+const MSS_OPTION_LENGTH: usize = 4;
 const OPTION_WINDOW_SCALE: u8 = 3;
 const WINDOW_SCALE_OPTION_LENGTH: usize = 3;
 
@@ -452,12 +454,31 @@ pub const WINDOW_SCALE_HEADER_LENGTH: usize = 24;
 impl TcpHeader<'_> {
     /// Shift count of the Window Scale option (RFC 7323 §2.2), if the header carries one.
     pub fn window_scale(&self) -> Option<u8> {
+        let option = find_option(self.options()?, OPTION_WINDOW_SCALE)?;
+        if option.len() != WINDOW_SCALE_OPTION_LENGTH {
+            return None;
+        }
+        Some(cmp::min(option[2], MAX_WINDOW_SCALE))
+    }
+
+    /// Maximum Segment Size option (RFC 9293 §3.7.1), if the header carries one.
+    pub fn mss(&self) -> Option<u16> {
+        let option = find_option(self.options()?, OPTION_MSS)?;
+        if option.len() != MSS_OPTION_LENGTH {
+            return None;
+        }
+        Some(u16::from_be_bytes([option[2], option[3]]))
+    }
+
+    fn options(&self) -> Option<&[u8]> {
         let end = cmp::min(usize::from(self.data.header_length), self.raw.len());
-        parse_window_scale(self.raw.get(20..end)?)
+        self.raw.get(20..end)
     }
 }
 
-fn parse_window_scale(options: &[u8]) -> Option<u8> {
+/// The option of the given kind, kind and length bytes included. None if it is absent or if the
+/// options are malformed.
+fn find_option(options: &[u8], wanted: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < options.len() {
         match options[i] {
@@ -469,11 +490,8 @@ fn parse_window_scale(options: &[u8]) -> Option<u8> {
                     // malformed options
                     return None;
                 }
-                if kind == OPTION_WINDOW_SCALE {
-                    if length != WINDOW_SCALE_OPTION_LENGTH {
-                        return None;
-                    }
-                    return Some(cmp::min(options[i + 2], MAX_WINDOW_SCALE));
+                if kind == wanted {
+                    return Some(&options[i..i + length]);
                 }
                 i += length;
             }
@@ -543,6 +561,37 @@ mod tests {
         assert_eq!(None, window_scale_of(&syn_header(&[8, 0, 3, 3, 7, 0, 0, 0])));
         // a length running past the end of the header
         assert_eq!(None, window_scale_of(&syn_header(&[8, 10, 1, 3, 3, 7, 0, 0])));
+    }
+
+    fn mss_of(raw: &[u8]) -> Option<u16> {
+        let data = TcpHeaderData::parse(raw);
+        data.bind(raw).mss()
+    }
+
+    #[test]
+    fn parse_mss_from_linux_syn() {
+        // the SYN of a device whose VPN interface has a 16384-byte MTU
+        let options = [2, 4, 0x3f, 0xd8, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7];
+        assert_eq!(Some(16344), mss_of(&syn_header(&options)));
+    }
+
+    #[test]
+    fn parse_mss_after_other_options() {
+        assert_eq!(Some(1460), mss_of(&syn_header(&[1, 3, 3, 7, 2, 4, 0x05, 0xb4])));
+    }
+
+    #[test]
+    fn parse_mss_absent() {
+        assert_eq!(None, mss_of(&syn_header(&[])));
+        assert_eq!(None, mss_of(&syn_header(&[1, 3, 3, 7])));
+    }
+
+    #[test]
+    fn parse_mss_rejects_malformed_options() {
+        // wrong length for an MSS option
+        assert_eq!(None, mss_of(&syn_header(&[2, 3, 0x05, 1])));
+        // a length running past the end of the header
+        assert_eq!(None, mss_of(&syn_header(&[2, 8, 0x05, 0xb4])));
     }
 
     #[test]
